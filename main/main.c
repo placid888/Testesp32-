@@ -30,7 +30,6 @@
 
 #define LCD_W         240
 #define LCD_H         135
-// [修正 1] 避開系統內建的 LINE_MAX 命名衝突
 #define CMD_LINE_MAX  128  
 #define HEARTBEAT_MS  1000
 
@@ -51,7 +50,37 @@ static dashboard_t ui = {
 static int64_t last_rx_us = 0;
 static portMUX_TYPE state_lock = portMUX_INITIALIZER_UNLOCKED;
 
-// --- 簡易字元轉 HID 鍵碼 (僅支援英數字與空白) ---
+// ==========================================
+// [新增] USB HID 描述符與必要的回呼函式
+// ==========================================
+enum {
+    REPORT_ID_KEYBOARD = 1,
+    REPORT_ID_MOUSE = 2
+};
+
+// 告訴 PC 這是包含鍵盤與滑鼠的複合裝置
+static uint8_t const desc_hid_report[] = {
+    TUD_HID_REPORT_DESC_KEYBOARD(HID_REPORT_ID(REPORT_ID_KEYBOARD)),
+    TUD_HID_REPORT_DESC_MOUSE(HID_REPORT_ID(REPORT_ID_MOUSE))
+};
+
+// 回呼 1：PC 請求裝置描述符時觸發
+uint8_t const * tud_hid_descriptor_report_cb(uint8_t instance) {
+    return desc_hid_report;
+}
+
+// 回呼 2：PC 讀取狀態時觸發 (此專案由 ESP32 主動發送，故回傳 0)
+uint16_t tud_hid_get_report_cb(uint8_t instance, uint8_t report_id, hid_report_type_t report_type, uint8_t* buffer, uint16_t reqlen) {
+    return 0;
+}
+
+// 回呼 3：PC 寫入狀態時觸發 (例如控制鍵盤 CapsLock 燈號，此處略過)
+void tud_hid_set_report_cb(uint8_t instance, uint8_t report_id, hid_report_type_t report_type, uint8_t const* buffer, uint16_t bufsize) {
+}
+// ==========================================
+
+
+// --- 簡易字元轉 HID 鍵碼 (支援英數字與空白) ---
 #define CHAR_TO_HID(c) ((c) >= 'a' && (c) <= 'z' ? HID_KEY_A + ((c) - 'a') : \
                         (c) >= 'A' && (c) <= 'Z' ? HID_KEY_A + ((c) - 'A') : \
                         (c) >= '1' && (c) <= '9' ? HID_KEY_1 + ((c) - '1') : \
@@ -64,27 +93,28 @@ static void execute_macro_command(const char *cmd) {
     int x, y, ms;
     uint8_t keycode[6] = {0};
 
+    // [修正] 加入正確的 Report ID
     if (sscanf(cmd, "KD:%c%c", &key, &extra) == 1) {
         keycode[0] = CHAR_TO_HID(key);
-        tud_hid_keyboard_report(0, 0, keycode);
+        tud_hid_keyboard_report(REPORT_ID_KEYBOARD, 0, keycode);
     } else if (sscanf(cmd, "KU:%c%c", &key, &extra) == 1) {
-        tud_hid_keyboard_report(0, 0, NULL);
+        tud_hid_keyboard_report(REPORT_ID_KEYBOARD, 0, NULL);
     } else if (sscanf(cmd, "TAP:%c%c", &key, &extra) == 1) {
         keycode[0] = CHAR_TO_HID(key);
-        tud_hid_keyboard_report(0, 0, keycode);
-        vTaskDelay(pdMS_TO_TICKS(30)); // 模擬人類按壓
-        tud_hid_keyboard_report(0, 0, NULL);
+        tud_hid_keyboard_report(REPORT_ID_KEYBOARD, 0, keycode);
+        vTaskDelay(pdMS_TO_TICKS(30)); 
+        tud_hid_keyboard_report(REPORT_ID_KEYBOARD, 0, NULL);
     } else if (sscanf(cmd, "MM:%d,%d%c", &x, &y, &extra) == 2) {
-        tud_hid_mouse_report(0, 0, (int8_t)x, (int8_t)y, 0, 0);
+        tud_hid_mouse_report(REPORT_ID_MOUSE, 0, (int8_t)x, (int8_t)y, 0, 0);
     } else if (strcmp(cmd, "MC:L") == 0) {
-        tud_hid_mouse_report(0, MOUSE_BUTTON_LEFT, 0, 0, 0, 0);
+        tud_hid_mouse_report(REPORT_ID_MOUSE, MOUSE_BUTTON_LEFT, 0, 0, 0, 0);
         vTaskDelay(pdMS_TO_TICKS(30));
-        tud_hid_mouse_report(0, 0, 0, 0, 0, 0);
+        tud_hid_mouse_report(REPORT_ID_MOUSE, 0, 0, 0, 0, 0);
     } else if (sscanf(cmd, "DLY:%d%c", &ms, &extra) == 1 && ms >= 0) {
         vTaskDelay(pdMS_TO_TICKS(ms));
     } else if (strcmp(cmd, "RELEASE_ALL") == 0) {
-        tud_hid_keyboard_report(0, 0, NULL);
-        tud_hid_mouse_report(0, 0, 0, 0, 0, 0);
+        tud_hid_keyboard_report(REPORT_ID_KEYBOARD, 0, NULL);
+        tud_hid_mouse_report(REPORT_ID_MOUSE, 0, 0, 0, 0, 0);
     } else {
         ESP_LOGW(TAG, "無效指令: %s", cmd);
     }
@@ -148,7 +178,7 @@ static void safety_task(void *arg) {
 
         portENTER_CRITICAL(&state_lock);
         if (ui.armed && last_rx_us > 0 && (now - last_rx_us) > HEARTBEAT_MS * 1000LL) {
-            ui.armed = false; // 逾時強制上鎖
+            ui.armed = false;
             expired = true;
         }
         portEXIT_CRITICAL(&state_lock);
@@ -193,7 +223,6 @@ static void lcd_task(void *arg) {
         armed = ui.armed;
         portEXIT_CRITICAL(&state_lock);
 
-        // 綠色(武裝), 紅色(鎖定)
         uint16_t fill_color = armed ? 0x07E0 : 0xF800;
 
         for (int i = 0; i < LCD_W * LCD_H; i++) {
@@ -246,7 +275,6 @@ void app_main(void) {
     ESP_ERROR_CHECK(tinyusb_driver_install(&tusb_cfg));
 
     tinyusb_config_cdcacm_t cdc_cfg = {
-        // [修正 2] 移除 .usb_dev = TINYUSB_USBDEV_0，解決 API 版本衝突
         .cdc_port = TINYUSB_CDC_ACM_0,
         .callback_rx = cdc_rx_cb,
     };
