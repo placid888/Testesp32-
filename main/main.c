@@ -30,8 +30,9 @@
 
 #define LCD_W         240
 #define LCD_H         135
-#define LINE_MAX      128
-#define HEARTBEAT_MS 1000
+// [修正 1] 避開系統內建的 LINE_MAX 命名衝突
+#define CMD_LINE_MAX  128  
+#define HEARTBEAT_MS  1000
 
 static const char *TAG = "macro_terminal";
 static esp_lcd_panel_handle_t panel;
@@ -95,7 +96,7 @@ static void cdc_rx_cb(int itf, cdcacm_event_t *event) {
     size_t n = 0;
     if (tinyusb_cdcacm_read(itf, buf, sizeof(buf), &n) != ESP_OK) return;
 
-    static char line[LINE_MAX];
+    static char line[CMD_LINE_MAX];
     static size_t used = 0;
 
     portENTER_CRITICAL(&state_lock);
@@ -106,7 +107,7 @@ static void cdc_rx_cb(int itf, cdcacm_event_t *event) {
     for (size_t i = 0; i < n; ++i) {
         char c = (char)buf[i];
         if (c == '\r') continue;
-        if (c == '|' || c == '\n') { // 支援 "|" 作為批次指令分隔符號
+        if (c == '|' || c == '\n') {
             if (used > 0) {
                 line[used] = '\0';
                 xQueueSend(line_queue, line, 0);
@@ -120,7 +121,7 @@ static void cdc_rx_cb(int itf, cdcacm_event_t *event) {
 
 // --- 指令處理任務 (直譯器) ---
 static void command_task(void *arg) {
-    char cmd[LINE_MAX];
+    char cmd[CMD_LINE_MAX];
     while (true) {
         if (xQueueReceive(line_queue, cmd, portMAX_DELAY) == pdTRUE) {
             bool armed;
@@ -166,14 +167,13 @@ static void safety_task(void *arg) {
 static void IRAM_ATTR boot_isr(void *arg) {
     static TickType_t last_tick = 0;
     TickType_t now = xTaskGetTickCountFromISR();
-    if (now - last_tick < pdMS_TO_TICKS(200)) return; // 簡易防彈跳
+    if (now - last_tick < pdMS_TO_TICKS(200)) return; 
     last_tick = now;
 
     portENTER_CRITICAL_ISR(&state_lock);
     ui.armed = !ui.armed;
     portEXIT_CRITICAL_ISR(&state_lock);
 
-    // 如果切換回鎖定，要求安全任務釋放按鍵
     if (!ui.armed) {
         BaseType_t higher_woken = pdFALSE;
         char cmd[] = "RELEASE_ALL";
@@ -184,7 +184,6 @@ static void IRAM_ATTR boot_isr(void *arg) {
 
 // --- LCD 顏色渲染任務 ---
 static void lcd_task(void *arg) {
-    // 申請足夠畫滿整個螢幕的記憶體
     uint16_t *color_map = malloc(LCD_W * LCD_H * sizeof(uint16_t));
     if (!color_map) vTaskDelete(NULL);
 
@@ -194,18 +193,15 @@ static void lcd_task(void *arg) {
         armed = ui.armed;
         portEXIT_CRITICAL(&state_lock);
 
-        // 定義顏色 (RGB565格式)：綠色(武裝), 紅色(鎖定)
+        // 綠色(武裝), 紅色(鎖定)
         uint16_t fill_color = armed ? 0x07E0 : 0xF800;
 
-        // 填滿顏色陣列
         for (int i = 0; i < LCD_W * LCD_H; i++) {
             color_map[i] = fill_color;
         }
 
-        // 把顏色刷上螢幕
         esp_lcd_panel_draw_bitmap(panel, 0, 0, LCD_W, LCD_H, color_map);
-        
-        vTaskDelay(pdMS_TO_TICKS(100)); // 10FPS 更新頻率
+        vTaskDelay(pdMS_TO_TICKS(100)); 
     }
 }
 
@@ -237,28 +233,25 @@ static void init_lcd(void) {
     esp_lcd_new_panel_st7789(io, &panel_cfg, &panel);
     esp_lcd_panel_reset(panel);
     esp_lcd_panel_init(panel);
-    // ST7789 偏移設定
     esp_lcd_panel_set_gap(panel, 40, 53); 
-    esp_lcd_panel_invert_color(panel, true); // 確保顏色顯示正確
+    esp_lcd_panel_invert_color(panel, true);
     esp_lcd_panel_disp_on_off(panel, true);
 }
 
 void app_main(void) {
-    line_queue = xQueueCreate(16, LINE_MAX);
+    line_queue = xQueueCreate(16, CMD_LINE_MAX);
     init_lcd();
 
-    // 啟動 TinyUSB (同時掛載 CDC 和 HID)
     tinyusb_config_t tusb_cfg = { 0 }; 
     ESP_ERROR_CHECK(tinyusb_driver_install(&tusb_cfg));
 
     tinyusb_config_cdcacm_t cdc_cfg = {
-        .usb_dev = TINYUSB_USBDEV_0,
+        // [修正 2] 移除 .usb_dev = TINYUSB_USBDEV_0，解決 API 版本衝突
         .cdc_port = TINYUSB_CDC_ACM_0,
         .callback_rx = cdc_rx_cb,
     };
     ESP_ERROR_CHECK(tinyusb_cdcacm_init(&cdc_cfg));
 
-    // 設定 BOOT 按鍵中斷
     gpio_config_t boot = {
         .pin_bit_mask = 1ULL << BOOT_PIN,
         .mode = GPIO_MODE_INPUT,
